@@ -409,3 +409,7 @@ For production, set them via `az functionapp config appsettings set` (see [Deplo
 ### v3
 
 - LeetCode submission polling (accepted submissions) — automatically detect when you solve a problem and prompt for a journal entry
+
+### v4
+
+- Host leetcode_journal on the cloud for closed access usage, those who are interested can sign up for early-access
