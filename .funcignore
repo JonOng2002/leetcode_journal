@@ -1,0 +1,16 @@
+.venv
+.git
+.gitignore
+.vscode
+.env
+local.settings.json
+__pycache__
+__azurite*
+AzuriteConfig
+__blobstorage__
+__queuestorage__
+agents.md
+README.md
+config
+assets
+*.md

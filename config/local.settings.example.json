@@ -1,0 +1,11 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AzureWebJobsStorage": "",
+    "FUNCTIONS_WORKER_RUNTIME": "python",
+    "DISCORD_PUBLIC_KEY": "",
+    "DISCORD_APP_ID": "",
+    "NOTION_TOKEN": "",
+    "NOTION_DATABASE_ID": ""
+  }
+}

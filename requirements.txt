@@ -1,0 +1,5 @@
+azure-functions>=1.17.0
+fastapi>=0.110.0
+notion-client>=2.2.1
+PyNaCl>=1.5.0
+python-dotenv>=1.0.1
