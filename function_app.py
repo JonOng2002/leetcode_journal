@@ -10,12 +10,14 @@ import azure.functions as func
 from azure.data.tables import TableServiceClient
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from httpx import Client as HttpxClient
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 from notion_client import Client
 from openai import OpenAI
+import plotly.graph_objects as go
+from collections import Counter
 
 load_dotenv()
 
@@ -708,3 +710,91 @@ async def interactions(request: Request) -> JSONResponse:
         "type": 4,
         "data": {"content": "Unsupported interaction type.", "flags": 64},
     })
+
+
+# ---------------------------------------------------------------------------
+# Dashboard — Sankey diagram of all entries
+# ---------------------------------------------------------------------------
+@app.get("/dashboard")
+async def dashboard():
+    if not NOTION_TOKEN:
+        return HTMLResponse("<h1>NOTION_TOKEN not configured</h1>", status_code=500)
+
+    notion = Client(auth=NOTION_TOKEN)
+
+    # Fetch all pages with pagination
+    entries = []
+    cursor = None
+    while True:
+        query: dict = {"database_id": NOTION_DATABASE_ID, "page_size": 100}
+        if cursor:
+            query["start_cursor"] = cursor
+        resp = notion.databases.query(**query)
+        entries.extend(resp.get("results", []))
+        if not resp.get("has_more"):
+            break
+        cursor = resp.get("next_cursor")
+
+    # Count topics per category
+    dsa_topic_counts: Counter = Counter()
+    sql_topic_counts: Counter = Counter()
+    dsa_problems = 0
+    sql_problems = 0
+
+    for page in entries:
+        props = page.get("properties", {})
+        topics_prop = props.get("Topics", {}).get("multi_select", [])
+        topics = [t["name"] for t in topics_prop if t.get("name")]
+
+        if "SQL" in topics:
+            sql_problems += 1
+            for t in topics:
+                if t != "SQL":
+                    sql_topic_counts[t] += 1
+        else:
+            dsa_problems += 1
+            for t in topics:
+                dsa_topic_counts[t] += 1
+
+    # Build Sankey nodes and links
+    source_labels = ["DSA", "SQL"]
+    target_labels = list(dict.fromkeys(
+        list(dsa_topic_counts.keys()) + list(sql_topic_counts.keys())
+    ))
+    all_labels = source_labels + target_labels
+    topic_offset = len(source_labels)  # 2 — topics start at index 2
+
+    source_indices: list[int] = []
+    target_indices: list[int] = []
+    values: list[int] = []
+
+    for topic, count in dsa_topic_counts.items():
+        idx = topic_offset + target_labels.index(topic)
+        source_indices.append(0)
+        target_indices.append(idx)
+        values.append(count)
+
+    for topic, count in sql_topic_counts.items():
+        idx = topic_offset + target_labels.index(topic)
+        source_indices.append(1)
+        target_indices.append(idx)
+        values.append(count)
+
+    colors = ["#4CAF50", "#2196F3"] + ["#FFC107"] * len(target_labels)
+
+    fig = go.Figure(data=[go.Sankey(
+        node=dict(
+            label=all_labels,
+            color=colors,
+        ),
+        link=dict(
+            source=source_indices,
+            target=target_indices,
+            value=values,
+        ),
+    )])
+
+    title = f"SQL: {sql_problems} problems — DSA: {dsa_problems} problems"
+    fig.update_layout(title=title, font_size=12)
+
+    return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))

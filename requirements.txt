@@ -6,3 +6,4 @@ python-dotenv>=1.0.1
 azure-data-tables
 openai>=1.0.0
 httpx>=0.27.0
+plotly>=5.18.0
