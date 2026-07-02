@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 import azure.functions as func
+from azure.data.tables import TableServiceClient
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -18,20 +19,86 @@ PUBLIC_KEY = os.getenv("DISCORD_PUBLIC_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_DATABASE_URL = os.getenv("NOTION_DATABASE_URL", "")
+TABLE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "UseDevelopmentStorage=true")
 
 app = FastAPI()
 function_app = func.AsgiFunctionApp(app=app, http_auth_level=func.AuthLevel.ANONYMOUS)
 
-
-# ---------------------------------------------------------------------------
-# Multi-step journaling state
-# ---------------------------------------------------------------------------
-# In-memory sessions (for local dev). Replace with Table Storage for prod.
-_sessions: dict[str, dict] = {}
-_session_times: dict[str, float] = {}
-
 SESSION_TTL_SECONDS = 15 * 60  # 15 minutes
 NOTION_MAX_RETRIES = 3
+
+
+# ---------------------------------------------------------------------------
+# Persistent session store using Azure Table Storage
+# Falls back to in-memory dict when Table Storage is unavailable
+# (no Azurite required for local dev).
+# ---------------------------------------------------------------------------
+class SessionStore:
+    """Persistent session store backed by Azure Table Storage.
+    Falls back to an in-memory dict if Table Storage is unavailable
+    (e.g. Azurite not running locally)."""
+
+    TABLE_NAME = "leetcodejournalsessions"
+
+    def __init__(self):
+        self._memory: dict[str, dict] = {}
+        try:
+            self._client = TableServiceClient.from_connection_string(TABLE_CONNECTION_STRING)
+            self._table = self._client.create_table_if_not_exists(self.TABLE_NAME)
+            self._use_table = True
+        except Exception:
+            self._use_table = False
+
+    def _row_key(self, user_id: str) -> str:
+        return f"session_{user_id}"
+
+    def _expired(self, entry: dict) -> bool:
+        return time.time() - entry.get("_timestamp", 0) > SESSION_TTL_SECONDS
+
+    def get(self, user_id: str) -> dict:
+        if self._use_table:
+            try:
+                entity = self._table.get_entity(
+                    partition_key="default", row_key=self._row_key(user_id)
+                )
+                if self._expired(entity):
+                    self.delete(user_id)
+                    return {}
+                return json.loads(entity.get("data", "{}"))
+            except Exception:
+                pass
+        entry = self._memory.get(user_id)
+        if not entry or self._expired(entry):
+            self._memory.pop(user_id, None)
+            return {}
+        return entry["data"]
+
+    def set(self, user_id: str, session: dict) -> None:
+        payload = json.dumps(session)
+        if self._use_table:
+            try:
+                self._table.upsert_entity({
+                    "PartitionKey": "default",
+                    "RowKey": self._row_key(user_id),
+                    "_timestamp": time.time(),
+                    "data": payload,
+                })
+                return
+            except Exception:
+                pass
+        self._memory[user_id] = {"_timestamp": time.time(), "data": session}
+
+    def delete(self, user_id: str) -> None:
+        if self._use_table:
+            try:
+                self._table.delete_entity("default", self._row_key(user_id))
+            except Exception:
+                pass
+        self._memory.pop(user_id, None)
+
+
+# Global session store (backed by Table Storage, with in-memory fallback)
+_store = SessionStore()
 
 JOURNAL_STEPS = [
     {"field": "problem",      "label": "What problem did you solve?",            "style": 1, "required": True},
@@ -65,19 +132,11 @@ def parse_lcj_custom_id(custom_id: str) -> tuple[str, str, int] | None:
     return parts[2], kind, step
 
 
-def _clean_sessions() -> None:
-    """Remove expired sessions."""
-    now = time.time()
-    expired = [uid for uid, ts in _session_times.items() if now - ts > SESSION_TTL_SECONDS]
-    for uid in expired:
-        _sessions.pop(uid, None)
-        _session_times.pop(uid, None)
-
-
 def _ensure_session(user_id: str) -> None:
-    if user_id not in _sessions:
-        _sessions[user_id] = {}
-    _session_times[user_id] = time.time()
+    """Ensure a session dict exists for user (fetch or create from Table Storage)."""
+    session = _store.get(user_id)
+    if not session:
+        _store.set(user_id, {})
 
 
 def build_continue_button(user_id: str, next_step_index: int) -> JSONResponse:
@@ -281,9 +340,6 @@ async def interactions(request: Request) -> JSONResponse:
     payload = json.loads(body)
     interaction_type = payload.get("type")
 
-    # ── cleanup expired sessions ──────────────────────────────────────
-    _clean_sessions()
-
     # ── PING ──────────────────────────────────────────────────────────
     if interaction_type == 1:
         return JSONResponse({"type": 1})
@@ -299,8 +355,7 @@ async def interactions(request: Request) -> JSONResponse:
         command_name = payload.get("data", {}).get("name", "")
 
         if command_name == "journal":
-            _ensure_session(user_id)
-            _sessions[user_id] = {}
+            _store.set(user_id, {})
             return build_step_modal(user_id, 0)
 
     # ── COMPONENT (button / select / summary confirm/cancel) ──────────
@@ -312,8 +367,8 @@ async def interactions(request: Request) -> JSONResponse:
             btn_user = custom_id.rsplit("_", 1)[-1]
             if btn_user != user_id:
                 return JSONResponse({"type": 4, "data": {"content": "Not yours.", "flags": 64}})
-            session = _sessions.pop(user_id, {})
-            _session_times.pop(user_id, None)
+            session = _store.get(user_id)
+            _store.delete(user_id)
             if not session:
                 return JSONResponse({"type": 4, "data": {"content": "No entry. /journal?", "flags": 64}})
             notion_url, error = save_to_notion(session)
@@ -330,8 +385,7 @@ async def interactions(request: Request) -> JSONResponse:
         if custom_id.startswith("lcj_x_"):
             btn_user = custom_id.rsplit("_", 1)[-1]
             if btn_user == user_id:
-                _sessions.pop(user_id, None)
-                _session_times.pop(user_id, None)
+                _store.delete(user_id)
             return JSONResponse({"type": 4, "data": {"content": "Entry discarded. /journal to start over.", "flags": 64}})
 
         parsed = parse_lcj_custom_id(custom_id)
@@ -343,7 +397,9 @@ async def interactions(request: Request) -> JSONResponse:
                 return JSONResponse({"type": 4, "data": {"content": "Not your menu.", "flags": 64}})
             selected = (payload.get("data", {}).get("values", []) or [""])[0]
             _ensure_session(user_id)
-            _sessions[user_id]["difficulty"] = selected
+            session = _store.get(user_id)
+            session["difficulty"] = selected
+            _store.set(user_id, session)
             return build_continue_button(user_id, 2)
 
         # Continue button
@@ -383,12 +439,13 @@ async def interactions(request: Request) -> JSONResponse:
                 },
             })
 
-        _sessions[user_id][step["field"]] = value
-        _session_times[user_id] = time.time()
+        session = _store.get(user_id)
+        session[step["field"]] = value
+        _store.set(user_id, session)
 
         # Last step → show summary for confirmation
         if step_index + 1 >= TOTAL_STEPS:
-            return build_summary(user_id, _sessions[user_id])
+            return build_summary(user_id, session)
 
         # Problem → difficulty dropdown
         if step_index == 0:
