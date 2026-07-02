@@ -1,5 +1,7 @@
+import base64
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -9,9 +11,11 @@ from azure.data.tables import TableServiceClient
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from httpx import Client as HttpxClient
 from nacl.exceptions import BadSignatureError
 from nacl.signing import VerifyKey
 from notion_client import Client
+from openai import OpenAI
 
 load_dotenv()
 
@@ -26,6 +30,34 @@ function_app = func.AsgiFunctionApp(app=app, http_auth_level=func.AuthLevel.ANON
 
 SESSION_TTL_SECONDS = 15 * 60  # 15 minutes
 NOTION_MAX_RETRIES = 3
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+_openai: OpenAI | None = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+_http = HttpxClient()
+
+NEETCODE_TOPICS = [
+    "Arrays & Hashing", "Two Pointers", "Stack", "Binary Search",
+    "Sliding Window", "Linked List", "Trees", "Tries",
+    "Heap / Priority Queue", "Intervals", "Greedy", "Advanced Graphs",
+    "Backtracking", "Graphs", "1-D DP", "2-D DP", "Bit Manipulation",
+    "Math & Geometry",
+]
+
+VISION_PROMPT = """You are analyzing a LeetCode problem solution screenshot.
+
+Extract the following fields and return ONLY valid JSON (no markdown, no code fences):
+
+{
+  "problem": "The problem title (e.g. 'Two Sum')",
+  "difficulty": "One of: Easy, Medium, Hard",
+  "topics": ["Array of topic tags from the NeetCode roadmap that best match this problem. Only use tags from this list: Arrays & Hashing, Two Pointers, Stack, Binary Search, Sliding Window, Linked List, Trees, Tries, Heap / Priority Queue, Intervals, Greedy, Advanced Graphs, Backtracking, Graphs, 1-D DP, 2-D DP, Bit Manipulation, Math & Geometry"],
+  "leetcode_url": "The LeetCode problem URL if visible, otherwise empty string",
+  "code": "The code solution shown in the screenshot (preserve exact formatting)",
+  "is_sql": false,
+  "reflection": "A brief personal reflection (1-2 sentences) on what was learned or what was challenging"
+}
+
+Be thorough - check for the problem name in the page title, URL bar, or problem description. If topics aren't obvious from the problem, infer them from the solution approach."""
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +287,10 @@ def build_notion_properties(session: dict[str, Any]) -> dict[str, Any]:
         return {"type": "text", "text": {"content": content}, "annotations": annotations}
 
     topics_raw = session.get("topics", "")
-    topics = [t.strip() for t in topics_raw.split(",") if t.strip()]
+    if isinstance(topics_raw, list):
+        topics = topics_raw
+    else:
+        topics = [t.strip() for t in topics_raw.split(",") if t.strip()]
 
     return {
         "Name": {"title": [_text(session.get("problem", ""))]},
@@ -332,6 +367,137 @@ def build_summary(user_id: str, session: dict) -> JSONResponse:
     })
 
 
+# ---------------------------------------------------------------------------
+# AI Vision pipeline
+# ---------------------------------------------------------------------------
+
+def _display_topics(topics: Any) -> str:
+    if isinstance(topics, list):
+        return ", ".join(topics)
+    return str(topics or "")
+
+
+def call_vision_api(image_bytes: bytes, content_type: str) -> dict:
+    """Send image to GPT-4o mini and return extracted fields."""
+    b64 = base64.b64encode(image_bytes).decode("utf-8")
+    data_uri = f"data:{content_type};base64,{b64}"
+
+    if not _openai:
+        raise RuntimeError("OPENAI_API_KEY is not configured")
+
+    response = _openai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": VISION_PROMPT},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }
+        ],
+        response_format={"type": "json_object"},
+        max_tokens=2000,
+    )
+    return json.loads(response.choices[0].message.content)
+
+
+def _edit_discord_webhook(application_id: str, interaction_token: str, data: dict) -> None:
+    url = f"https://discord.com/api/v10/webhooks/{application_id}/{interaction_token}/messages/@original"
+    _http.patch(url, json=data, timeout=10)
+
+
+def process_vision_background(
+    application_id: str, interaction_token: str, attachment_url: str, user_id: str
+) -> None:
+    """Download image, call vision API, save session, update Discord."""
+    try:
+        resp = _http.get(attachment_url, timeout=30)
+        resp.raise_for_status()
+        result = call_vision_api(resp.content, resp.headers.get("content-type", "image/png"))
+
+        # Normalize topics to comma-separated string for session storage
+        if isinstance(result.get("topics"), list):
+            result["topics"] = ", ".join(result["topics"])
+
+        _store.set(user_id, result)
+        data = build_vision_preview_data(user_id, result)
+        _edit_discord_webhook(application_id, interaction_token, data)
+    except Exception as exc:
+        _edit_discord_webhook(application_id, interaction_token, {
+            "content": f"❌ Vision processing failed: {exc}",
+            "flags": 64,
+        })
+
+
+def build_vision_preview_data(user_id: str, session: dict) -> dict:
+    """Return data dict for the AI vision preview message."""
+    code_preview = _preview(session.get("code", ""))
+    reflection_preview = _preview(session.get("reflection", ""))
+    topics = _display_topics(session.get("topics", ""))
+    lines = [
+        "🤖 **AI extracted from screenshot:**",
+        f"• **Problem:** {session.get('problem', '—')}",
+        f"• **Difficulty:** {session.get('difficulty', '—')}",
+        f"• **Topics:** {topics}",
+        f"• **URL:** {session.get('leetcode_url', '—')}",
+        f"• **Code:** {code_preview}",
+        f"• **Reflection:** {reflection_preview}",
+        "",
+        "Confirm or edit before saving:",
+    ]
+    return {
+        "content": "\n".join(lines),
+        "flags": 64,
+        "components": [
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2, "style": 3, "label": "Confirm & Save",
+                        "custom_id": f"lcj_ai_v_{user_id}",
+                    },
+                    {
+                        "type": 2, "style": 1, "label": "Edit Topics",
+                        "custom_id": f"lcj_ai_e_{user_id}",
+                    },
+                    {
+                        "type": 2, "style": 4, "label": "Cancel",
+                        "custom_id": f"lcj_ai_x_{user_id}",
+                    },
+                ],
+            }
+        ],
+    }
+
+
+def build_vision_topic_modal(user_id: str, session: dict) -> JSONResponse:
+    topics = _display_topics(session.get("topics", ""))
+    return JSONResponse({
+        "type": 9,
+        "data": {
+            "custom_id": f"lcj_ai_t_{user_id}",
+            "title": "Edit Topics",
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 4,
+                            "custom_id": "topics",
+                            "label": "Topics (comma-separated)",
+                            "style": 1,
+                            "required": True,
+                            "value": topics,
+                            "max_length": 1000,
+                        }
+                    ],
+                }
+            ],
+        },
+    })
+
+
 @app.post("/interactions")
 async def interactions(request: Request) -> JSONResponse:
     body = await request.body()
@@ -355,12 +521,79 @@ async def interactions(request: Request) -> JSONResponse:
         command_name = payload.get("data", {}).get("name", "")
 
         if command_name == "journal":
+            # Check for optional screenshot attachment
+            resolved = payload.get("data", {}).get("resolved", {})
+            attachments = resolved.get("attachments", {})
+            if attachments:
+                if not _openai:
+                    return JSONResponse({
+                        "type": 4,
+                        "data": {
+                            "content": "❌ OPENAI_API_KEY is not configured. Vision screenshot upload is unavailable.",
+                            "flags": 64,
+                        },
+                    })
+                att = next(iter(attachments.values()))
+                attachment_url = att.get("url") or att.get("proxy_url", "")
+                threading.Thread(
+                    target=process_vision_background,
+                    args=(
+                        payload.get("application_id", ""),
+                        payload.get("token", ""),
+                        attachment_url,
+                        user_id,
+                    ),
+                    daemon=True,
+                ).start()
+                return JSONResponse({
+                    "type": 4,
+                    "data": {
+                        "content": "🔍 Analyzing your screenshot...",
+                        "flags": 64,
+                    },
+                })
             _store.set(user_id, {})
             return build_step_modal(user_id, 0)
 
     # ── COMPONENT (button / select / summary confirm/cancel) ──────────
     if interaction_type == 3:
         custom_id = payload.get("data", {}).get("custom_id", "")
+
+        # AI Vision: Confirm & Save
+        if custom_id.startswith("lcj_ai_v_"):
+            btn_user = custom_id.rsplit("_", 1)[-1]
+            if btn_user != user_id:
+                return JSONResponse({"type": 4, "data": {"content": "Not yours.", "flags": 64}})
+            session = _store.get(user_id)
+            _store.delete(user_id)
+            if not session:
+                return JSONResponse({"type": 4, "data": {"content": "No entry. /journal?", "flags": 64}})
+            notion_url, error = save_to_notion(session)
+            if error:
+                return JSONResponse({"type": 4, "data": {"content": f"Notion error: {error}", "flags": 64}})
+            content = "Saved your entry to Notion! 🎉"
+            if notion_url:
+                content += f"\n\n[Open in Notion]({notion_url})"
+            if NOTION_DATABASE_URL:
+                content += f"\n[View all entries]({NOTION_DATABASE_URL})"
+            return JSONResponse({"type": 4, "data": {"content": content, "flags": 64}})
+
+        # AI Vision: Edit Topics (open modal)
+        if custom_id.startswith("lcj_ai_e_"):
+            btn_user = custom_id.rsplit("_", 1)[-1]
+            if btn_user != user_id:
+                return JSONResponse({"type": 4, "data": {"content": "Not yours.", "flags": 64}})
+            session = _store.get(user_id)
+            if not session:
+                return JSONResponse({"type": 4, "data": {"content": "No entry. /journal?", "flags": 64}})
+            return build_vision_topic_modal(user_id, session)
+
+        # AI Vision: Cancel
+        if custom_id.startswith("lcj_ai_x_"):
+            btn_user = custom_id.rsplit("_", 1)[-1]
+            if btn_user == user_id:
+                _store.delete(user_id)
+            return JSONResponse({"type": 4, "data": {"content": "Entry discarded. /journal to start over.", "flags": 64}})
 
         # Summary: Save
         if custom_id.startswith("lcj_v_"):
@@ -414,6 +647,23 @@ async def interactions(request: Request) -> JSONResponse:
     # ── MODAL SUBMIT ──────────────────────────────────────────────────
     if interaction_type == 5:
         modal_id = payload.get("data", {}).get("custom_id", "")
+
+        # AI Vision: Topic edit modal
+        if modal_id.startswith("lcj_ai_t_"):
+            modal_user = modal_id.rsplit("_", 1)[-1]
+            if modal_user != user_id:
+                return JSONResponse({"type": 4, "data": {"content": "Not yours.", "flags": 64}})
+            session = _store.get(user_id)
+            if not session:
+                return JSONResponse({"type": 4, "data": {"content": "No entry. /journal?", "flags": 64}})
+            value = extract_modal_value(
+                payload.get("data", {}).get("components", []),
+                "topics",
+            )
+            session["topics"] = value or ""
+            _store.set(user_id, session)
+            return JSONResponse({"type": 4, "data": build_vision_preview_data(user_id, session)})
+
         parsed = parse_lcj_custom_id(modal_id)
 
         if parsed is None or parsed[1] != "s":
