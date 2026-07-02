@@ -717,84 +717,98 @@ async def interactions(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 @app.get("/dashboard")
 async def dashboard():
-    if not NOTION_TOKEN:
-        return HTMLResponse("<h1>NOTION_TOKEN not configured</h1>", status_code=500)
+    try:
+        if not NOTION_TOKEN:
+            return HTMLResponse("<h1>NOTION_TOKEN not configured</h1>", status_code=500)
 
-    notion = Client(auth=NOTION_TOKEN)
+        headers = {
+            "Authorization": f"Bearer {NOTION_TOKEN}",
+            "Notion-Version": "2022-06-28",
+            "Content-Type": "application/json",
+        }
 
-    # Fetch all pages with pagination
-    entries = []
-    cursor = None
-    while True:
-        query: dict = {"database_id": NOTION_DATABASE_ID, "page_size": 100}
-        if cursor:
-            query["start_cursor"] = cursor
-        resp = notion.databases.query(**query)
-        entries.extend(resp.get("results", []))
-        if not resp.get("has_more"):
-            break
-        cursor = resp.get("next_cursor")
+        # Fetch all pages with pagination via raw REST API
+        entries = []
+        cursor = None
+        while True:
+            body: dict = {"page_size": 100}
+            if cursor:
+                body["start_cursor"] = cursor
+            resp = _http.post(
+                f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
+                headers=headers,
+                json=body,
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            entries.extend(data.get("results", []))
+            if not data.get("has_more"):
+                break
+            cursor = data.get("next_cursor")
 
-    # Count topics per category
-    dsa_topic_counts: Counter = Counter()
-    sql_topic_counts: Counter = Counter()
-    dsa_problems = 0
-    sql_problems = 0
+        # Count topics per category
+        dsa_topic_counts: Counter = Counter()
+        sql_topic_counts: Counter = Counter()
+        dsa_problems = 0
+        sql_problems = 0
 
-    for page in entries:
-        props = page.get("properties", {})
-        topics_prop = props.get("Topics", {}).get("multi_select", [])
-        topics = [t["name"] for t in topics_prop if t.get("name")]
+        for page in entries:
+            props = page.get("properties", {})
+            topics_prop = props.get("Topics", {}).get("multi_select", [])
+            topics = [t["name"] for t in topics_prop if t.get("name")]
 
-        if "SQL" in topics:
-            sql_problems += 1
-            for t in topics:
-                if t != "SQL":
-                    sql_topic_counts[t] += 1
-        else:
-            dsa_problems += 1
-            for t in topics:
-                dsa_topic_counts[t] += 1
+            if "SQL" in topics:
+                sql_problems += 1
+                for t in topics:
+                    if t != "SQL":
+                        sql_topic_counts[t] += 1
+            else:
+                dsa_problems += 1
+                for t in topics:
+                    dsa_topic_counts[t] += 1
 
-    # Build Sankey nodes and links
-    source_labels = ["DSA", "SQL"]
-    target_labels = list(dict.fromkeys(
-        list(dsa_topic_counts.keys()) + list(sql_topic_counts.keys())
-    ))
-    all_labels = source_labels + target_labels
-    topic_offset = len(source_labels)  # 2 — topics start at index 2
+        total = dsa_problems + sql_problems
 
-    source_indices: list[int] = []
-    target_indices: list[int] = []
-    values: list[int] = []
+        # Build Sankey nodes and links
+        source_labels = ["DSA", "SQL"]
+        target_labels = list(dict.fromkeys(
+            list(dsa_topic_counts.keys()) + list(sql_topic_counts.keys())
+        ))
+        all_labels = source_labels + target_labels
+        topic_offset = len(source_labels)
 
-    for topic, count in dsa_topic_counts.items():
-        idx = topic_offset + target_labels.index(topic)
-        source_indices.append(0)
-        target_indices.append(idx)
-        values.append(count)
+        source_indices: list[int] = []
+        target_indices: list[int] = []
+        values: list[int] = []
 
-    for topic, count in sql_topic_counts.items():
-        idx = topic_offset + target_labels.index(topic)
-        source_indices.append(1)
-        target_indices.append(idx)
-        values.append(count)
+        for topic, count in dsa_topic_counts.items():
+            idx = topic_offset + target_labels.index(topic)
+            source_indices.append(0)
+            target_indices.append(idx)
+            values.append(count)
 
-    colors = ["#4CAF50", "#2196F3"] + ["#FFC107"] * len(target_labels)
+        for topic, count in sql_topic_counts.items():
+            idx = topic_offset + target_labels.index(topic)
+            source_indices.append(1)
+            target_indices.append(idx)
+            values.append(count)
 
-    fig = go.Figure(data=[go.Sankey(
-        node=dict(
-            label=all_labels,
-            color=colors,
-        ),
-        link=dict(
-            source=source_indices,
-            target=target_indices,
-            value=values,
-        ),
-    )])
+        if not source_indices:
+            return HTMLResponse("<h2>No entries found in the database yet.</h2>")
 
-    title = f"SQL: {sql_problems} problems — DSA: {dsa_problems} problems"
-    fig.update_layout(title=title, font_size=12)
+        colors = ["#4CAF50", "#2196F3"] + ["#FFC107"] * len(target_labels)
 
-    return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
+        fig = go.Figure(data=[go.Sankey(
+            node=dict(label=all_labels, color=colors),
+            link=dict(source=source_indices, target=target_indices, value=values),
+        )])
+
+        fig.update_layout(
+            title=f"Total: {total} problems — SQL: {sql_problems}, DSA: {dsa_problems}",
+            font_size=12,
+        )
+
+        return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
+    except Exception as exc:
+        return HTMLResponse(f"<h2>Dashboard error</h2><pre>{exc}</pre>", status_code=500)
