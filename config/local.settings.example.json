@@ -6,6 +6,7 @@
     "DISCORD_PUBLIC_KEY": "",
     "DISCORD_APP_ID": "",
     "NOTION_TOKEN": "",
-    "NOTION_DATABASE_ID": ""
+    "NOTION_DATABASE_ID": "",
+    "OPENAI_API_KEY": ""
   }
 }
