@@ -1,8 +1,10 @@
+import asyncio
 import base64
 import json
 import os
-import threading
 import time
+import uuid
+from collections import Counter, deque
 from datetime import datetime, timezone
 from typing import Any
 
@@ -17,6 +19,15 @@ from nacl.signing import VerifyKey
 from notion_client import Client
 from openai import OpenAI
 import plotly.graph_objects as go
+
+# ── Debug log ring buffer (last 100 entries, accessible via /debug/logs) ──
+_INSTANCE_ID = uuid.uuid4().hex[:8]
+_debug_logs: deque = deque(maxlen=100)
+
+
+def _log(tag: str, msg: str) -> None:
+    entry = f"[{datetime.now(timezone.utc).isoformat()}] [{_INSTANCE_ID}] {tag}: {msg}"
+    _debug_logs.append(entry)
 from collections import Counter
 
 load_dotenv()
@@ -25,7 +36,10 @@ PUBLIC_KEY = os.getenv("DISCORD_PUBLIC_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_DATABASE_URL = os.getenv("NOTION_DATABASE_URL", "")
-TABLE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING", "UseDevelopmentStorage=true")
+TABLE_CONNECTION_STRING = os.getenv(
+    "AZURE_STORAGE_CONNECTION_STRING",
+    os.getenv("AzureWebJobsStorage", "UseDevelopmentStorage=true"),
+)
 
 app = FastAPI()
 function_app = func.AsgiFunctionApp(app=app, http_auth_level=func.AuthLevel.ANONYMOUS)
@@ -133,6 +147,60 @@ class SessionStore:
 
 # Global session store (backed by Table Storage, with in-memory fallback)
 _store = SessionStore()
+
+
+# ── Shared log store (Table Storage backed, survives multi-instance) ──
+class LogStore:
+    TABLE_NAME = "leetcodejournallogs"
+
+    def __init__(self):
+        self._memory: deque = deque(maxlen=100)
+        try:
+            self._client = TableServiceClient.from_connection_string(TABLE_CONNECTION_STRING)
+            self._table = self._client.create_table_if_not_exists(self.TABLE_NAME)
+            self._use_table = True
+        except Exception:
+            self._use_table = False
+
+    def write(self, tag: str, message: str) -> None:
+        ts = int(time.time() * 1000)
+        entry = f"[{datetime.now(timezone.utc).isoformat()}] [{_INSTANCE_ID}] {tag}: {message}"
+        self._memory.append(entry)
+        if self._use_table:
+            try:
+                self._table.upsert_entity({
+                    "PartitionKey": tag,
+                    "RowKey": f"{ts}_{_INSTANCE_ID}",
+                    "_timestamp": time.time(),
+                    "instance": _INSTANCE_ID,
+                    "message": message,
+                })
+            except Exception:
+                pass
+
+    def recent(self, limit: int = 100) -> list[str]:
+        recent = list(self._memory)[-limit:]
+        if self._use_table:
+            try:
+                entities = self._table.query_entities(
+                    query_filter="", select=["instance", "message", "_timestamp"],
+                    top=50,
+                )
+                for e in entities:
+                    ts = datetime.fromtimestamp(e.get("_timestamp", 0), tz=timezone.utc).isoformat()
+                    ins = e.get("instance", "?")
+                    msg = e.get("message", "")
+                    recent.append(f"[{ts}] [{ins}] table: {msg}")
+            except Exception:
+                pass
+        return recent[-limit:]
+
+
+_log_store = LogStore()
+
+
+def _log(tag: str, message: str) -> None:
+    _log_store.write(tag, message)
 
 JOURNAL_STEPS = [
     {"field": "problem",      "label": "What problem did you solve?",            "style": 1, "required": True},
@@ -300,7 +368,7 @@ def build_notion_properties(session: dict[str, Any]) -> dict[str, Any]:
         "Problem": {"rich_text": [_text(session.get("problem", ""))]},
         "Difficulty": {"select": {"name": session.get("difficulty", "")}},
         "Topics": {"multi_select": [{"name": t} for t in topics]},
-        "LeetCode URL": {"url": session.get("leetcode_url", "")},
+        "LeetCode URL": {"url": session.get("leetcode_url") or None},
         "Code Snippet": {"rich_text": [_text(session.get("code", "")[:2000], code=True)]},
         "Reflection": {"rich_text": [_text(session.get("reflection", "")[:2000])]},
     }
@@ -312,13 +380,17 @@ def save_to_notion(session: dict) -> tuple[str, str]:
     for attempt in range(1, NOTION_MAX_RETRIES + 1):
         try:
             notion = Client(auth=NOTION_TOKEN)
+            props = build_notion_properties(session)
+            _log("notion", f"save attempt {attempt}")
             page = notion.pages.create(
                 parent={"database_id": NOTION_DATABASE_ID},
-                properties=build_notion_properties(session),
+                properties=props,
             )
+            _log("notion", "save succeeded")
             return page.get("url", ""), ""
         except Exception as exc:
             last_error = str(exc)
+            _log("notion", f"attempt {attempt} failed: {exc}")
             if "rate" in last_error.lower():
                 time.sleep(1 * attempt)
             else:
@@ -404,32 +476,32 @@ def call_vision_api(image_bytes: bytes, content_type: str) -> dict:
     return json.loads(response.choices[0].message.content)
 
 
-def _edit_discord_webhook(application_id: str, interaction_token: str, data: dict) -> None:
-    url = f"https://discord.com/api/v10/webhooks/{application_id}/{interaction_token}/messages/@original"
-    _http.patch(url, json=data, timeout=10)
-
-
-def process_vision_background(
+async def process_vision_async(
     application_id: str, interaction_token: str, attachment_url: str, user_id: str
 ) -> None:
-    """Download image, call vision API, save session, update Discord."""
+    """Background async task: download image, call AI, PATCH Discord webhook."""
+    webhook_url = f"https://discord.com/api/v10/webhooks/{application_id}/{interaction_token}/messages/@original"
+    _log("vision", f"start processing for user {user_id[:8]}...")
     try:
-        resp = _http.get(attachment_url, timeout=30)
+        resp = await asyncio.to_thread(_http.get, attachment_url, timeout=30)
         resp.raise_for_status()
+        _log("vision", f"downloaded image ({len(resp.content)} bytes)")
         result = call_vision_api(resp.content, resp.headers.get("content-type", "image/png"))
-
-        # Normalize topics to comma-separated string for session storage
+        _log("vision", f"AI result: problem={result.get('problem')}, topics={result.get('topics')}")
         if isinstance(result.get("topics"), list):
             result["topics"] = ", ".join(result["topics"])
-
         _store.set(user_id, result)
+        _log("vision", "session saved to store")
         data = build_vision_preview_data(user_id, result)
-        _edit_discord_webhook(application_id, interaction_token, data)
+        await asyncio.to_thread(_http.patch, webhook_url, json=data, timeout=10)
+        _log("vision", "discord message patched with preview")
     except Exception as exc:
-        _edit_discord_webhook(application_id, interaction_token, {
-            "content": f"❌ Vision processing failed: {exc}",
-            "flags": 64,
-        })
+        _log("vision", f"error: {type(exc).__name__}: {exc}")
+        await asyncio.to_thread(
+            _http.patch, webhook_url,
+            json={"content": f"❌ Vision failed: {exc}", "flags": 64},
+            timeout=10,
+        )
 
 
 def build_vision_preview_data(user_id: str, session: dict) -> dict:
@@ -500,15 +572,22 @@ def build_vision_topic_modal(user_id: str, session: dict) -> JSONResponse:
     })
 
 
+@app.get("/keepalive")
+async def keepalive():
+    """Pinged every 5 min by UptimeRobot to prevent cold starts."""
+    _log("keepalive", "ping")
+    return JSONResponse({"ok": True, "time": time.time()})
+
+
 @app.post("/interactions")
 async def interactions(request: Request) -> JSONResponse:
     body = await request.body()
+    payload = json.loads(body)
+    _log("interaction", f"type={payload.get('type')} name={payload.get('data',{}).get('name','?')}")
     verify_discord_signature(request, body)
 
-    payload = json.loads(body)
     interaction_type = payload.get("type")
 
-    # ── PING ──────────────────────────────────────────────────────────
     if interaction_type == 1:
         return JSONResponse({"type": 1})
 
@@ -518,35 +597,25 @@ async def interactions(request: Request) -> JSONResponse:
         or ""
     )
 
-    # ── SLASH COMMAND ─────────────────────────────────────────────────
     if interaction_type == 2:
         command_name = payload.get("data", {}).get("name", "")
+        print(f"[interaction] slash command: /{command_name} by user {user_id}")
+        _log("interaction", f"/{command_name} by user {user_id[:8]}...")
 
         if command_name == "journal":
-            # Check for optional screenshot attachment
             resolved = payload.get("data", {}).get("resolved", {})
             attachments = resolved.get("attachments", {})
+            _log("journal", f"attachments: {list(attachments.keys()) if attachments else 'none'}")
             if attachments:
-                if not _openai:
-                    return JSONResponse({
-                        "type": 4,
-                        "data": {
-                            "content": "❌ OPENAI_API_KEY is not configured. Vision screenshot upload is unavailable.",
-                            "flags": 64,
-                        },
-                    })
+                _store.set(user_id, {})
                 att = next(iter(attachments.values()))
-                attachment_url = att.get("url") or att.get("proxy_url", "")
-                threading.Thread(
-                    target=process_vision_background,
-                    args=(
-                        payload.get("application_id", ""),
-                        payload.get("token", ""),
-                        attachment_url,
-                        user_id,
-                    ),
-                    daemon=True,
-                ).start()
+                url = att.get("url") or att.get("proxy_url", "")
+                asyncio.create_task(process_vision_async(
+                    payload.get("application_id", ""),
+                    payload.get("token", ""),
+                    url,
+                    user_id,
+                ))
                 return JSONResponse({
                     "type": 4,
                     "data": {
@@ -572,7 +641,9 @@ async def interactions(request: Request) -> JSONResponse:
                 return JSONResponse({"type": 4, "data": {"content": "No entry. /journal?", "flags": 64}})
             notion_url, error = save_to_notion(session)
             if error:
-                return JSONResponse({"type": 4, "data": {"content": f"Notion error: {error}", "flags": 64}})
+                short = error[:500] + "…" if len(error) > 500 else error
+                return JSONResponse({"type": 4, "data": {"content": f"❌ Notion: {short}", "flags": 64}})
+            _log("save", f"ai vision entry saved to notion")
             content = "Saved your entry to Notion! 🎉"
             if notion_url:
                 content += f"\n\n[Open in Notion]({notion_url})"
@@ -608,7 +679,9 @@ async def interactions(request: Request) -> JSONResponse:
                 return JSONResponse({"type": 4, "data": {"content": "No entry. /journal?", "flags": 64}})
             notion_url, error = save_to_notion(session)
             if error:
-                return JSONResponse({"type": 4, "data": {"content": f"Notion error: {error}", "flags": 64}})
+                short = error[:500] + "…" if len(error) > 500 else error
+                return JSONResponse({"type": 4, "data": {"content": f"❌ Notion: {short}", "flags": 64}})
+            _log("save", "modal entry saved to notion")
             content = "Saved your entry to Notion! 🎉"
             if notion_url:
                 content += f"\n\n[Open in Notion]({notion_url})"
@@ -715,6 +788,17 @@ async def interactions(request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 # Dashboard — Sankey diagram of all entries
 # ---------------------------------------------------------------------------
+@app.get("/debug/logs")
+async def debug_logs():
+    lines = _log_store.recent(100)
+    _log("debug", f"viewed logs ({len(lines)} entries)")
+    html = f"""<html><body>
+<h2>Debug Logs (instance: {_INSTANCE_ID})</h2>
+<pre>{"[no logs]" if not lines else chr(10).join(lines)}</pre>
+</body></html>"""
+    return HTMLResponse(html)
+
+
 @app.get("/dashboard")
 async def dashboard():
     try:
