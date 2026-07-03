@@ -59,21 +59,34 @@ NEETCODE_TOPICS = [
     "Math & Geometry",
 ]
 
+VALID_TOPICS = NEETCODE_TOPICS + [
+    "DSA", "SQL",
+    "Joins", "Aggregation", "Subqueries", "CTEs",
+    "Window Functions", "Basic Queries",
+]
+
 VISION_PROMPT = """You are analyzing a LeetCode problem solution screenshot.
+
+First detect whether this is a SQL problem or a DSA (general coding) problem.
 
 Extract the following fields and return ONLY valid JSON (no markdown, no code fences):
 
 {
   "problem": "The problem title (e.g. 'Two Sum')",
   "difficulty": "One of: Easy, Medium, Hard",
-  "topics": ["Array of topic tags from the NeetCode roadmap that best match this problem. Only use tags from this list: Arrays & Hashing, Two Pointers, Stack, Binary Search, Sliding Window, Linked List, Trees, Tries, Heap / Priority Queue, Intervals, Greedy, Advanced Graphs, Backtracking, Graphs, 1-D DP, 2-D DP, Bit Manipulation, Math & Geometry"],
+  "is_sql": true or false,
+  "is_dsa": true or false,
+  "topics": ["An array of topic tags. Exactly one of 'SQL' or 'DSA' must be included. For SQL problems, include 'SQL' plus sub-tags like Joins, Aggregation, Subqueries, CTEs, Window Functions, Basic Queries, Group-By. For DSA problems, include 'DSA' plus specific NeetCode tags from this list: Arrays & Hashing, Two Pointers, Stack, Binary Search, Sliding Window, Linked List, Trees, Tries, Heap / Priority Queue, Intervals, Greedy, Advanced Graphs, Backtracking, Graphs, 1-D DP, 2-D DP, Bit Manipulation, Math & Geometry."],
   "leetcode_url": "The LeetCode problem URL if visible, otherwise empty string",
   "code": "The code solution shown in the screenshot (preserve exact formatting)",
-  "is_sql": false,
   "reflection": "A brief personal reflection (1-2 sentences) on what was learned or what was challenging"
 }
 
-Be thorough - check for the problem name in the page title, URL bar, or problem description. If topics aren't obvious from the problem, infer them from the solution approach."""
+Rules:
+- Exactly one of is_sql or is_dsa must be true.
+- is_sql and is_dsa cannot both be true.
+- The topics array must always start with either 'SQL' or 'DSA'.
+- Be thorough — check for the problem name in the page title, URL bar, or problem description."""
 
 
 # ---------------------------------------------------------------------------
@@ -145,7 +158,7 @@ class SessionStore:
         self._memory.pop(user_id, None)
 
 
-# Global session store (backed by Table Storage, with in-memory fallback)
+# ── Global session store (backed by Table Storage, with in-memory fallback) ──
 _store = SessionStore()
 
 
@@ -786,7 +799,10 @@ async def interactions(request: Request) -> JSONResponse:
 
 
 # ---------------------------------------------------------------------------
-# Dashboard — Sankey diagram of all entries
+# Dashboard — 3-layer Sankey with difficulty breakdown
+# Layer 0: Category (DSA / SQL)
+# Layer 1: Category + Difficulty (e.g. "DSA · Easy")
+# Layer 2: Topic tags
 # ---------------------------------------------------------------------------
 @app.get("/debug/logs")
 async def debug_logs():
@@ -797,6 +813,22 @@ async def debug_logs():
 <pre>{"[no logs]" if not lines else chr(10).join(lines)}</pre>
 </body></html>"""
     return HTMLResponse(html)
+
+
+def _color(cat: str, difficulty: str, alpha: float = 1) -> str:
+    """Return an rgba color string for a node."""
+    palette = {
+        ("DSA", "Easy"): (76, 175, 80),
+        ("DSA", "Medium"): (255, 152, 0),
+        ("DSA", "Hard"): (244, 67, 54),
+        ("DSA", "Unknown"): (158, 158, 158),
+        ("SQL", "Easy"): (33, 150, 243),
+        ("SQL", "Medium"): (156, 39, 176),
+        ("SQL", "Hard"): (233, 30, 99),
+        ("SQL", "Unknown"): (158, 158, 158),
+    }
+    r, g, b = palette.get((cat, difficulty), (158, 158, 158))
+    return f"rgba({r},{g},{b},{alpha})"
 
 
 @app.get("/dashboard")
@@ -811,7 +843,7 @@ async def dashboard():
             "Content-Type": "application/json",
         }
 
-        # Fetch all pages with pagination via raw REST API
+        # Fetch all pages with pagination
         entries = []
         cursor = None
         while True:
@@ -820,9 +852,7 @@ async def dashboard():
                 body["start_cursor"] = cursor
             resp = _http.post(
                 f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
-                headers=headers,
-                json=body,
-                timeout=30,
+                headers=headers, json=body, timeout=30,
             )
             resp.raise_for_status()
             data = resp.json()
@@ -831,68 +861,125 @@ async def dashboard():
                 break
             cursor = data.get("next_cursor")
 
-        # Count topics per category
-        dsa_topic_counts: Counter = Counter()
-        sql_topic_counts: Counter = Counter()
-        dsa_problems = 0
-        sql_problems = 0
+        if not entries:
+            return HTMLResponse("<h2>No entries found in the database yet.</h2>")
+
+        # Count by (category, difficulty, topic)
+        cd_topic_counts: Counter = Counter()     # (cat, diff, topic) -> count
+        cd_problem_counts: Counter = Counter()   # (cat, diff) -> count of problems
+        cat_counts: Counter = Counter()           # cat -> count
 
         for page in entries:
             props = page.get("properties", {})
-            topics_prop = props.get("Topics", {}).get("multi_select", [])
-            topics = [t["name"] for t in topics_prop if t.get("name")]
+            topics = [t["name"] for t in props.get("Topics", {}).get("multi_select", []) if t.get("name")]
+            diff = "Unknown"
+            diff_prop = props.get("Difficulty", {}).get("select")
+            if diff_prop and diff_prop.get("name") in ("Easy", "Medium", "Hard"):
+                diff = diff_prop["name"]
 
+            cat = "DSA"
             if "SQL" in topics:
-                sql_problems += 1
-                for t in topics:
-                    if t != "SQL":
-                        sql_topic_counts[t] += 1
-            else:
-                dsa_problems += 1
-                for t in topics:
-                    dsa_topic_counts[t] += 1
+                cat = "SQL"
 
-        total = dsa_problems + sql_problems
+            cat_counts[cat] += 1
+            cd_problem_counts[(cat, diff)] += 1
 
-        # Build Sankey nodes and links
-        source_labels = ["DSA", "SQL"]
-        target_labels = list(dict.fromkeys(
-            list(dsa_topic_counts.keys()) + list(sql_topic_counts.keys())
-        ))
-        all_labels = source_labels + target_labels
-        topic_offset = len(source_labels)
+            for t in topics:
+                if t not in ("SQL", "DSA"):
+                    cd_topic_counts[(cat, diff, t)] += 1
 
-        source_indices: list[int] = []
-        target_indices: list[int] = []
+        # Build node labels for 3 layers
+        cats = ["DSA", "SQL"]
+        diffs = ["Easy", "Medium", "Hard", "Unknown"]
+
+        layer0 = cats                                           # categories
+        layer1 = []                                              # cat · diff
+        for c in cats:
+            for d in diffs:
+                if cd_problem_counts[(c, d)]:
+                    layer1.append(f"{c} · {d}")
+
+        layer2 = sorted({
+            t for (c, d, t) in cd_topic_counts
+        })
+
+        all_labels = layer0 + layer1 + layer2
+        l0_end = len(layer0)
+        l1_end = l0_end + len(layer1)
+        l2_end = l1_end + len(layer2)
+
+        # Build node index lookup
+        idx_of = {lbl: i for i, lbl in enumerate(all_labels)}
+
+        # Build links: layer0 → layer1, layer1 → layer2
+        sources: list[int] = []
+        targets: list[int] = []
         values: list[int] = []
+        link_colors: list[str] = []
 
-        for topic, count in dsa_topic_counts.items():
-            idx = topic_offset + target_labels.index(topic)
-            source_indices.append(0)
-            target_indices.append(idx)
-            values.append(count)
+        for c in cats:
+            for d in diffs:
+                key = (c, d)
+                cnt = cd_problem_counts[key]
+                if not cnt:
+                    continue
+                src = idx_of[c]
+                dst = idx_of.get(f"{c} · {d}")
+                if dst is None:
+                    continue
+                sources.append(src)
+                targets.append(dst)
+                values.append(cnt)
+                link_colors.append(_color(c, d, 0.5))
 
-        for topic, count in sql_topic_counts.items():
-            idx = topic_offset + target_labels.index(topic)
-            source_indices.append(1)
-            target_indices.append(idx)
-            values.append(count)
+                for t in layer2:
+                    cnt2 = cd_topic_counts[(c, d, t)]
+                    if not cnt2:
+                        continue
+                    sources.append(dst)
+                    targets.append(idx_of[t])
+                    values.append(cnt2)
+                    link_colors.append(_color(c, d, 0.3))
 
-        if not source_indices:
-            return HTMLResponse("<h2>No entries found in the database yet.</h2>")
-
-        colors = ["#4CAF50", "#2196F3"] + ["#FFC107"] * len(target_labels)
+        # Node colors
+        node_colors = []
+        for lbl in all_labels:
+            if lbl in cats:
+                node_colors.append(_color(lbl, "Unknown", 0.9))
+            elif " · " in lbl:
+                parts = lbl.split(" · ")
+                node_colors.append(_color(parts[0], parts[1], 0.85))
+            else:
+                node_colors.append("rgba(158,158,158,0.8)")
 
         fig = go.Figure(data=[go.Sankey(
-            node=dict(label=all_labels, color=colors),
-            link=dict(source=source_indices, target=target_indices, value=values),
+            arrangement="snap",
+            node=dict(
+                label=all_labels,
+                color=node_colors,
+                pad=15,
+                thickness=20,
+                line=dict(color="rgba(0,0,0,0.1)", width=1),
+            ),
+            link=dict(
+                source=sources,
+                target=targets,
+                value=values,
+                color=link_colors,
+            ),
         )])
 
+        dsa_total = cat_counts.get("DSA", 0)
+        sql_total = cat_counts.get("SQL", 0)
+
         fig.update_layout(
-            title=f"Total: {total} problems — SQL: {sql_problems}, DSA: {dsa_problems}",
-            font_size=12,
+            title=f"<b>Total: {dsa_total + sql_total} problems</b> — DSA: {dsa_total}, SQL: {sql_total}",
+            font=dict(size=14, family="Arial"),
+            height=600,
+            margin=dict(l=10, r=10, t=60, b=10),
         )
 
         return HTMLResponse(fig.to_html(include_plotlyjs="cdn"))
     except Exception as exc:
+        _log("dashboard", f"error: {type(exc).__name__}: {exc}")
         return HTMLResponse(f"<h2>Dashboard error</h2><pre>{exc}</pre>", status_code=500)
