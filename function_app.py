@@ -441,7 +441,10 @@ DIGEST_PROMPT = """You are a learning tracker assistant. Given this user's LeetC
 This week's data:
 {data}
 
-Write a friendly, motivational summary about their progress. Include specific numbers. Keep it concise."""
+Their personal reflections from each entry:
+{reflections}
+
+Write a friendly, motivational summary about their progress. Include specific numbers and reference what they learned or found challenging based on their reflections. Keep it concise."""
 
 
 def build_weekly_digest() -> dict:
@@ -486,6 +489,7 @@ def build_weekly_digest() -> dict:
     dsa_topics: Counter = Counter()
     sql_by_diff: Counter = Counter()
     dsa_by_diff: Counter = Counter()
+    reflections: list[dict] = []
 
     for page in week_entries:
         props = page.get("properties", {})
@@ -494,6 +498,13 @@ def build_weekly_digest() -> dict:
         diff_prop = props.get("Difficulty", {}).get("select")
         if diff_prop and diff_prop.get("name") in ("Easy", "Medium", "Hard"):
             diff = diff_prop["name"]
+
+        # Collect reflection
+        ref_parts = props.get("Reflection", {}).get("rich_text", [])
+        reflection_text = "".join(r.get("text", {}).get("content", "") for r in ref_parts if r.get("text"))
+        if reflection_text:
+            problem_name = props.get("Name", {}).get("title", [{}])[0].get("text", {}).get("content", "?")
+            reflections.append({"problem": problem_name, "reflection": reflection_text[:300]})
 
         if "SQL" in topics:
             sql_count += 1
@@ -514,6 +525,7 @@ def build_weekly_digest() -> dict:
         "total": len(week_entries),
         "sql": {"count": sql_count, "topics": dict(sql_topics), "by_difficulty": dict(sql_by_diff)},
         "dsa": {"count": dsa_count, "topics": dict(dsa_topics), "by_difficulty": dict(dsa_by_diff)},
+        "reflections": reflections,
     }
 
 
@@ -553,11 +565,13 @@ def format_digest_message(digest: dict) -> str:
     # AI summary
     if _openai and digest['total'] > 0:
         data_str = "\n".join(lines)
+        refs = digest.get("reflections", [])
+        ref_text = "\n".join(f"- {r['problem']}: {r['reflection']}" for r in refs) if refs else "None"
         try:
             summary = _openai.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[{"role": "user", "content": DIGEST_PROMPT.format(data=data_str)}],
-                max_tokens=400,
+                messages=[{"role": "user", "content": DIGEST_PROMPT.format(data=data_str, reflections=ref_text)}],
+                max_tokens=500,
             ).choices[0].message.content.strip()
             lines.append("")
             lines.append(summary)
