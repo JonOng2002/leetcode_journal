@@ -533,6 +533,13 @@ async def interactions(request: Request) -> JSONResponse:
         print(f"[interaction] slash command: /{command_name} by user {user_id}")
         _log("interaction", f"/{command_name} by user {user_id[:8]}...")
 
+        if command_name == "ping":
+            _log("ping", f"by user {user_id[:8]}...")
+            return JSONResponse({
+                "type": 4,
+                "data": {"content": "🏓 Pong! Bot is alive.", "flags": 64},
+            })
+
         if command_name == "journal":
             resolved = payload.get("data", {}).get("resolved", {})
             attachments = resolved.get("attachments", {})
