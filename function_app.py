@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 from collections import Counter, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import uvicorn
@@ -34,6 +34,8 @@ PUBLIC_KEY = os.getenv("DISCORD_PUBLIC_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_DATABASE_URL = os.getenv("NOTION_DATABASE_URL", "")
+DIGEST_USER_ID = os.getenv("DIGEST_USER_ID", "")
+DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "")
 
 app = FastAPI()
 
@@ -426,6 +428,171 @@ Return ONLY the polished reflection text, no JSON, no markdown, no quotes."""
     return response.choices[0].message.content.strip()
 
 
+def _week_range() -> tuple[str, str]:
+    """Return (monday_iso, sunday_iso) for the current ISO week."""
+    today = datetime.now(timezone.utc)
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+    return monday.date().isoformat(), sunday.date().isoformat()
+
+
+DIGEST_PROMPT = """You are a learning tracker assistant. Given this user's LeetCode/data problem data for the past week, write a short encouraging 1-2 paragraph summary.
+
+This week's data:
+{data}
+
+Write a friendly, motivational summary about their progress. Include specific numbers. Keep it concise."""
+
+
+def build_weekly_digest() -> dict:
+    """Query Notion for this week's entries and return a digest dict."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    monday, sunday = _week_range()
+
+    entries = []
+    cursor = None
+    while True:
+        body: dict = {"page_size": 100}
+        if cursor:
+            body["start_cursor"] = cursor
+        resp = _http.post(
+            f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
+            headers=headers, json=body, timeout=30,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        entries.extend(data.get("results", []))
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
+
+    # Filter to this week
+    week_entries = []
+    for page in entries:
+        date_prop = page.get("properties", {}).get("Date", {}).get("date")
+        if not date_prop or not date_prop.get("start"):
+            continue
+        entry_date = date_prop["start"][:10]
+        if monday <= entry_date <= sunday:
+            week_entries.append(page)
+
+    sql_count = 0
+    dsa_count = 0
+    sql_topics: Counter = Counter()
+    dsa_topics: Counter = Counter()
+    sql_by_diff: Counter = Counter()
+    dsa_by_diff: Counter = Counter()
+
+    for page in week_entries:
+        props = page.get("properties", {})
+        topics = [t["name"] for t in props.get("Topics", {}).get("multi_select", []) if t.get("name")]
+        diff = "Unknown"
+        diff_prop = props.get("Difficulty", {}).get("select")
+        if diff_prop and diff_prop.get("name") in ("Easy", "Medium", "Hard"):
+            diff = diff_prop["name"]
+
+        if "SQL" in topics:
+            sql_count += 1
+            for t in topics:
+                if t != "SQL":
+                    sql_topics[t] += 1
+            sql_by_diff[diff] += 1
+        else:
+            dsa_count += 1
+            for t in topics:
+                if t != "DSA":
+                    dsa_topics[t] += 1
+            dsa_by_diff[diff] += 1
+
+    return {
+        "monday": monday,
+        "sunday": sunday,
+        "total": len(week_entries),
+        "sql": {"count": sql_count, "topics": dict(sql_topics), "by_difficulty": dict(sql_by_diff)},
+        "dsa": {"count": dsa_count, "topics": dict(dsa_topics), "by_difficulty": dict(dsa_by_diff)},
+    }
+
+
+def format_digest_message(digest: dict) -> str:
+    """Build a Discord-ready summary message from a digest dict."""
+    lines = [f"📊 **Weekly Digest** ({digest['monday']} — {digest['sunday']})", ""]
+    lines.append(f"**Total: {digest['total']} problems**")
+    if digest['total'] == 0:
+        lines.append("\nNo entries this week. Keep going! 💪")
+        return "\n".join(lines)
+
+    sql = digest['sql']
+    dsa = digest['dsa']
+    lines.append(f"   SQL: {sql['count']} | DSA: {dsa['count']}")
+    lines.append("")
+
+    if dsa['count']:
+        lines.append("**DSA:**")
+        topics = ", ".join(f"{t} ({c})" for t, c in sorted(dsa['topics'].items(), key=lambda x: -x[1]))
+        if topics:
+            lines.append(f"   Topics: {topics}")
+        diff = ", ".join(f"{d}: {c}" for d, c in sorted(dsa['by_difficulty'].items()))
+        if diff:
+            lines.append(f"   Difficulty: {diff}")
+        lines.append("")
+
+    if sql['count']:
+        lines.append("**SQL:**")
+        topics = ", ".join(f"{t} ({c})" for t, c in sorted(sql['topics'].items(), key=lambda x: -x[1]))
+        if topics:
+            lines.append(f"   Topics: {topics}")
+        diff = ", ".join(f"{d}: {c}" for d, c in sorted(sql['by_difficulty'].items()))
+        if diff:
+            lines.append(f"   Difficulty: {diff}")
+        lines.append("")
+
+    # AI summary
+    if _openai and digest['total'] > 0:
+        data_str = "\n".join(lines)
+        try:
+            summary = _openai.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": DIGEST_PROMPT.format(data=data_str)}],
+                max_tokens=400,
+            ).choices[0].message.content.strip()
+            lines.append("")
+            lines.append(summary)
+        except Exception as exc:
+            _log("digest", f"ai summary failed: {exc}")
+
+    return "\n".join(lines)
+
+
+async def send_discord_dm(user_id: str, content: str) -> bool:
+    """Send a DM to a Discord user using the bot token. Returns success."""
+    if not DISCORD_BOT_TOKEN:
+        _log("digest", "no DISCORD_BOT_TOKEN set, skipping DM")
+        return False
+    try:
+        dm = _http.post(
+            f"https://discord.com/api/v10/users/{user_id}/channels",
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"},
+            json={"recipient_id": user_id},
+            timeout=10,
+        )
+        dm.raise_for_status()
+        channel_id = dm.json().get("id")
+        _http.post(
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            headers={"Authorization": f"Bot {DISCORD_BOT_TOKEN}", "Content-Type": "application/json"},
+            json={"content": content},
+            timeout=10,
+        )
+        return True
+    except Exception as exc:
+        _log("digest", f"DM failed: {exc}")
+        return False
+
+
 async def process_vision_async(
     application_id: str, interaction_token: str, attachment_url: str, user_id: str
 ) -> None:
@@ -560,6 +727,25 @@ async def keepalive():
     return JSONResponse({"ok": True, "time": time.time()})
 
 
+@app.get("/cron/digest")
+async def cron_digest():
+    """Called by cron-job.org every Sunday at noon. Sends weekly digest as DM."""
+    _log("cron", "digest triggered")
+    try:
+        digest = build_weekly_digest()
+        msg = format_digest_message(digest)
+        if DIGEST_USER_ID and DISCORD_BOT_TOKEN:
+            ok = await send_discord_dm(DIGEST_USER_ID, msg)
+            _log("cron", f"DM sent: {ok}")
+            return JSONResponse({"ok": ok, "total": digest["total"]})
+        else:
+            _log("cron", "DIGEST_USER_ID or DISCORD_BOT_TOKEN not set, returning JSON")
+            return JSONResponse(digest)
+    except Exception as exc:
+        _log("cron", f"error: {exc}")
+        return HTMLResponse(f"<h2>Error</h2><pre>{exc}</pre>", status_code=500)
+
+
 @app.post("/interactions")
 async def interactions(request: Request) -> JSONResponse:
     body = await request.body()
@@ -588,6 +774,20 @@ async def interactions(request: Request) -> JSONResponse:
             return JSONResponse({
                 "type": 4,
                 "data": {"content": "🏓 Pong! Bot is alive.", "flags": 64},
+            })
+
+        if command_name == "digest":
+            _log("digest", f"by user {user_id[:8]}...")
+            HEADER = "\n".join([f"📊 **Weekly Digest** ({_week_range()[0]} — {_week_range()[1]})", ""])
+            try:
+                digest = build_weekly_digest()
+                msg = format_digest_message(digest)
+            except Exception as exc:
+                _log("digest", f"build failed: {exc}")
+                msg = f"{HEADER}\n❌ Error building digest: {exc}"
+            return JSONResponse({
+                "type": 4,
+                "data": {"content": msg, "flags": 64},
             })
 
         if command_name == "journal":
