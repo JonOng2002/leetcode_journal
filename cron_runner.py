@@ -4,6 +4,7 @@
 import asyncio
 import os
 import sys
+from datetime import datetime, timezone, timedelta
 
 # Ensure the project root is on the path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -20,7 +21,9 @@ load_dotenv()
 
 
 async def main():
-    _log("cron", "started")
+    utc_now = datetime.now(timezone.utc)
+    sgt_now = utc_now + timedelta(hours=8)
+    _log("cron", f"started at UTC={utc_now.strftime('%H:%M')} SGT={sgt_now.strftime('%H:%M')}")
     user_id = os.getenv("DIGEST_USER_ID", "")
     bot_token = os.getenv("DISCORD_BOT_TOKEN", "")
 
