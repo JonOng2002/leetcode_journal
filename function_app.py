@@ -407,6 +407,25 @@ def call_vision_api(image_bytes: bytes, content_type: str) -> dict:
     return json.loads(response.choices[0].message.content)
 
 
+def polish_reflection(user_thoughts: str, problem: str, difficulty: str) -> str:
+    """Use AI to polish the user's rough reflection into a well-written one."""
+    prompt = f"""Rewrite this personal LeetCode reflection into 1-2 well-written sentences.
+Keep it natural and personal — like the user wrote it themselves, but clearer.
+
+Problem: {problem}
+Difficulty: {difficulty}
+User's rough thoughts: {user_thoughts}
+
+Return ONLY the polished reflection text, no JSON, no markdown, no quotes."""
+
+    response = _openai.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=300,
+    )
+    return response.choices[0].message.content.strip()
+
+
 async def process_vision_async(
     application_id: str, interaction_token: str, attachment_url: str, user_id: str
 ) -> None:
@@ -467,6 +486,10 @@ def build_vision_preview_data(user_id: str, session: dict) -> dict:
                         "custom_id": f"lcj_ai_e_{user_id}",
                     },
                     {
+                        "type": 2, "style": 1, "label": "Polish Reflection",
+                        "custom_id": f"lcj_ai_p_{user_id}",
+                    },
+                    {
                         "type": 2, "style": 4, "label": "Cancel",
                         "custom_id": f"lcj_ai_x_{user_id}",
                     },
@@ -495,6 +518,33 @@ def build_vision_topic_modal(user_id: str, session: dict) -> JSONResponse:
                             "required": True,
                             "value": topics,
                             "max_length": 1000,
+                        }
+                    ],
+                }
+            ],
+        },
+    })
+
+
+def build_reflection_modal(user_id: str, session: dict) -> JSONResponse:
+    reflection = session.get("reflection", "")
+    return JSONResponse({
+        "type": 9,
+        "data": {
+            "custom_id": f"lcj_ai_r_{user_id}",
+            "title": "Write Your Reflection",
+            "components": [
+                {
+                    "type": 1,
+                    "components": [
+                        {
+                            "type": 4,
+                            "custom_id": "reflection",
+                            "label": "What did you learn? (1-2 sentences)",
+                            "style": 2,
+                            "required": True,
+                            "value": reflection if isinstance(reflection, str) else "",
+                            "max_length": 2000,
                         }
                     ],
                 }
@@ -606,6 +656,16 @@ async def interactions(request: Request) -> JSONResponse:
                 _store.delete(user_id)
             return JSONResponse({"type": 4, "data": {"content": "Entry discarded. /journal to start over.", "flags": 64}})
 
+        # AI Vision: Polish Reflection (open modal)
+        if custom_id.startswith("lcj_ai_p_"):
+            btn_user = custom_id.rsplit("_", 1)[-1]
+            if btn_user != user_id:
+                return JSONResponse({"type": 4, "data": {"content": "Not yours.", "flags": 64}})
+            session = _store.get(user_id)
+            if not session:
+                return JSONResponse({"type": 4, "data": {"content": "No entry. /journal?", "flags": 64}})
+            return build_reflection_modal(user_id, session)
+
         # Summary: Save
         if custom_id.startswith("lcj_v_"):
             btn_user = custom_id.rsplit("_", 1)[-1]
@@ -674,6 +734,37 @@ async def interactions(request: Request) -> JSONResponse:
                 "topics",
             )
             session["topics"] = value or ""
+            _store.set(user_id, session)
+            return JSONResponse({"type": 4, "data": build_vision_preview_data(user_id, session)})
+
+        # AI Vision: Polish Reflection modal submit
+        if modal_id.startswith("lcj_ai_r_"):
+            modal_user = modal_id.rsplit("_", 1)[-1]
+            if modal_user != user_id:
+                return JSONResponse({"type": 4, "data": {"content": "Not yours.", "flags": 64}})
+            session = _store.get(user_id)
+            if not session:
+                return JSONResponse({"type": 4, "data": {"content": "No entry. /journal?", "flags": 64}})
+            raw = extract_modal_value(
+                payload.get("data", {}).get("components", []),
+                "reflection",
+            )
+            if not raw:
+                return JSONResponse({"type": 4, "data": {"content": "Please write something first.", "flags": 64}})
+            try:
+                if _openai:
+                    polished = await asyncio.to_thread(
+                        polish_reflection,
+                        raw,
+                        session.get("problem", ""),
+                        session.get("difficulty", ""),
+                    )
+                else:
+                    polished = raw
+            except Exception as exc:
+                _log("polish", f"failed: {exc}")
+                polished = raw
+            session["reflection"] = polished
             _store.set(user_id, session)
             return JSONResponse({"type": 4, "data": build_vision_preview_data(user_id, session)})
 
