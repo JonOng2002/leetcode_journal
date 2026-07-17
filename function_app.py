@@ -760,6 +760,54 @@ async def cron_digest():
         return HTMLResponse(f"<h2>Error</h2><pre>{exc}</pre>", status_code=500)
 
 
+def _today_count() -> int:
+    """Count how many entries were saved today in Notion."""
+    headers = {
+        "Authorization": f"Bearer {NOTION_TOKEN}",
+        "Notion-Version": "2022-06-28",
+        "Content-Type": "application/json",
+    }
+    today = datetime.now(timezone.utc).date().isoformat()
+    filter_payload = {
+        "filter": {
+            "property": "Date",
+            "date": {"equals": today},
+        },
+        "page_size": 100,
+    }
+    resp = _http.post(
+        f"https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query",
+        headers=headers, json=filter_payload, timeout=30,
+    )
+    resp.raise_for_status()
+    return len(resp.json().get("results", []))
+
+
+@app.get("/cron/daily")
+async def cron_daily():
+    """Called daily by cron-job.org. Reminds user if no entry today."""
+    _log("cron", "daily check triggered")
+    try:
+        count = _today_count()
+        _log("cron", f"entries today: {count}")
+
+        if count > 0:
+            msg = f"✅ You already journaled **{count}** time{'s' if count > 1 else ''} today. Great work! 🔥"
+        else:
+            msg = "📝 **No journal entry yet today!**\n\nRun `/journal` or upload a screenshot of your LeetCode solution. Keep the streak alive! 💪"
+
+        if DIGEST_USER_ID and DISCORD_BOT_TOKEN:
+            ok = await send_discord_dm(DIGEST_USER_ID, msg)
+            _log("cron", f"daily DM sent: {ok}")
+            return JSONResponse({"ok": ok, "entries_today": count})
+        else:
+            _log("cron", "DIGEST_USER_ID or DISCORD_BOT_TOKEN not set")
+            return JSONResponse({"entries_today": count})
+    except Exception as exc:
+        _log("cron", f"daily error: {exc}")
+        return HTMLResponse(f"<h2>Error</h2><pre>{exc}</pre>", status_code=500)
+
+
 @app.post("/interactions")
 async def interactions(request: Request) -> JSONResponse:
     body = await request.body()
