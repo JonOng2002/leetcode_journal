@@ -8,8 +8,7 @@ from collections import Counter, deque
 from datetime import datetime, timezone
 from typing import Any
 
-import azure.functions as func
-from azure.data.tables import TableServiceClient
+import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -28,7 +27,6 @@ _debug_logs: deque = deque(maxlen=100)
 def _log(tag: str, msg: str) -> None:
     entry = f"[{datetime.now(timezone.utc).isoformat()}] [{_INSTANCE_ID}] {tag}: {msg}"
     _debug_logs.append(entry)
-from collections import Counter
 
 load_dotenv()
 
@@ -36,13 +34,8 @@ PUBLIC_KEY = os.getenv("DISCORD_PUBLIC_KEY")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 NOTION_DATABASE_URL = os.getenv("NOTION_DATABASE_URL", "")
-TABLE_CONNECTION_STRING = os.getenv(
-    "AZURE_STORAGE_CONNECTION_STRING",
-    os.getenv("AzureWebJobsStorage", "UseDevelopmentStorage=true"),
-)
 
 app = FastAPI()
-function_app = func.AsgiFunctionApp(app=app, http_auth_level=func.AuthLevel.ANONYMOUS)
 
 SESSION_TTL_SECONDS = 15 * 60  # 15 minutes
 NOTION_MAX_RETRIES = 3
@@ -95,39 +88,15 @@ Rules:
 # (no Azurite required for local dev).
 # ---------------------------------------------------------------------------
 class SessionStore:
-    """Persistent session store backed by Azure Table Storage.
-    Falls back to an in-memory dict if Table Storage is unavailable
-    (e.g. Azurite not running locally)."""
-
-    TABLE_NAME = "leetcodejournalsessions"
+    """In-memory session store with TTL expiry."""
 
     def __init__(self):
         self._memory: dict[str, dict] = {}
-        try:
-            self._client = TableServiceClient.from_connection_string(TABLE_CONNECTION_STRING)
-            self._table = self._client.create_table_if_not_exists(self.TABLE_NAME)
-            self._use_table = True
-        except Exception:
-            self._use_table = False
-
-    def _row_key(self, user_id: str) -> str:
-        return f"session_{user_id}"
 
     def _expired(self, entry: dict) -> bool:
         return time.time() - entry.get("_timestamp", 0) > SESSION_TTL_SECONDS
 
     def get(self, user_id: str) -> dict:
-        if self._use_table:
-            try:
-                entity = self._table.get_entity(
-                    partition_key="default", row_key=self._row_key(user_id)
-                )
-                if self._expired(entity):
-                    self.delete(user_id)
-                    return {}
-                return json.loads(entity.get("data", "{}"))
-            except Exception:
-                pass
         entry = self._memory.get(user_id)
         if not entry or self._expired(entry):
             self._memory.pop(user_id, None)
@@ -135,26 +104,9 @@ class SessionStore:
         return entry["data"]
 
     def set(self, user_id: str, session: dict) -> None:
-        payload = json.dumps(session)
-        if self._use_table:
-            try:
-                self._table.upsert_entity({
-                    "PartitionKey": "default",
-                    "RowKey": self._row_key(user_id),
-                    "_timestamp": time.time(),
-                    "data": payload,
-                })
-                return
-            except Exception:
-                pass
         self._memory[user_id] = {"_timestamp": time.time(), "data": session}
 
     def delete(self, user_id: str) -> None:
-        if self._use_table:
-            try:
-                self._table.delete_entity("default", self._row_key(user_id))
-            except Exception:
-                pass
         self._memory.pop(user_id, None)
 
 
@@ -164,49 +116,15 @@ _store = SessionStore()
 
 # ── Shared log store (Table Storage backed, survives multi-instance) ──
 class LogStore:
-    TABLE_NAME = "leetcodejournallogs"
-
     def __init__(self):
         self._memory: deque = deque(maxlen=100)
-        try:
-            self._client = TableServiceClient.from_connection_string(TABLE_CONNECTION_STRING)
-            self._table = self._client.create_table_if_not_exists(self.TABLE_NAME)
-            self._use_table = True
-        except Exception:
-            self._use_table = False
 
     def write(self, tag: str, message: str) -> None:
-        ts = int(time.time() * 1000)
         entry = f"[{datetime.now(timezone.utc).isoformat()}] [{_INSTANCE_ID}] {tag}: {message}"
         self._memory.append(entry)
-        if self._use_table:
-            try:
-                self._table.upsert_entity({
-                    "PartitionKey": tag,
-                    "RowKey": f"{ts}_{_INSTANCE_ID}",
-                    "_timestamp": time.time(),
-                    "instance": _INSTANCE_ID,
-                    "message": message,
-                })
-            except Exception:
-                pass
 
     def recent(self, limit: int = 100) -> list[str]:
-        recent = list(self._memory)[-limit:]
-        if self._use_table:
-            try:
-                entities = self._table.query_entities(
-                    query_filter="", select=["instance", "message", "_timestamp"],
-                    top=50,
-                )
-                for e in entities:
-                    ts = datetime.fromtimestamp(e.get("_timestamp", 0), tz=timezone.utc).isoformat()
-                    ins = e.get("instance", "?")
-                    msg = e.get("message", "")
-                    recent.append(f"[{ts}] [{ins}] table: {msg}")
-            except Exception:
-                pass
-        return recent[-limit:]
+        return list(self._memory)[-limit:]
 
 
 _log_store = LogStore()
@@ -983,3 +901,8 @@ async def dashboard():
     except Exception as exc:
         _log("dashboard", f"error: {type(exc).__name__}: {exc}")
         return HTMLResponse(f"<h2>Dashboard error</h2><pre>{exc}</pre>", status_code=500)
+
+
+# ── Entrypoint for direct uvicorn run (Railway) ──
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
